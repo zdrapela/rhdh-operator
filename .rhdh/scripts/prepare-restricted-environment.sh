@@ -24,6 +24,9 @@ done
 
 # Operators
 declare prod_operator_index="${prod_operator_index:?Must set --prod_operator_index: for OCP 4.12, use registry.redhat.io/redhat/redhat-operator-index:v4.12 or quay.io/rhdh/iib:latest-v4.14-x86_64}"
+declare prod_operator_index_digest=$(skopeo inspect --tls-verify=false "docker://${prod_operator_index}" | jq -r .Digest)
+prod_operator_index="${prod_operator_index%:*}@${prod_operator_index_digest}"
+
 declare prod_operator_package_name="rhdh"
 declare prod_operator_bundle_name="rhdh-operator"
 declare prod_operator_version="${prod_operator_version:?Must set --prod_operator_version: for fast or fast-1.y channels, use v1.1.0, v1.1.1, etc.}"
@@ -179,6 +182,7 @@ EOF
 
     echo "  creating Route to access mirror registry: route/airgap-registry ..." >&2
     oc -n "${namespace}" create route edge --service=airgap-registry --insecure-policy=Redirect --dry-run=client -o yaml \
+      | sed 's/apiVersion: v1/apiVersion: route.openshift.io\/v1/' \
       | oc -n "${namespace}" apply -f - >&2
 
     local registry_url=$(oc get route airgap-registry -n "${namespace}" --template='{{ .spec.host }}')
@@ -286,7 +290,7 @@ oc patch OperatorHub cluster --type json \
     --patch '[{"op": "add", "path": "/spec/disableAllDefaultSources", "value": true}]'
 
 echo "[INFO] Deploying your catalog image to the $my_operator_index registry."
-skopeo copy --src-tls-verify=false --dest-tls-verify=false --all "containers-storage:$my_operator_index" "docker://$my_operator_index"
+skopeo copy --src-tls-verify=false --dest-tls-verify=false --all "docker-daemon:$my_operator_index" "docker://$my_operator_index"
 
 echo "[INFO] Removing index image from mappings.txt to prepare mirroring."
 oc adm catalog mirror "$my_operator_index" "$my_registry" --insecure --manifests-only | tee catalog_mirror.log
