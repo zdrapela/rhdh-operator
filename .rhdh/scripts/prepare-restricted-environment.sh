@@ -283,7 +283,7 @@ fi
 opm generate dockerfile "./${my_catalog}"
 
 echo "[INFO] Building the catalog image locally."
-podman build -t "${my_operator_index}" -f "./${my_catalog}.Dockerfile" --no-cache .
+podman build --platform=linux/amd64 -t "${my_operator_index}" -f "./${my_catalog}.Dockerfile" --no-cache .
 
 echo "[INFO] Disabling the default Red Hat Ecosystem Catalog."
 oc patch OperatorHub cluster --type json \
