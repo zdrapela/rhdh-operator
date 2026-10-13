@@ -1,9 +1,9 @@
 name: Nightly PostgreSQL Upgrade Test
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "25 0 * * *"
+  push:
+    branches:
+      - tmp/pg-upgrade-e2e-rehearsal
 
 jobs:
   postgresql-upgrade:
@@ -23,14 +23,13 @@ jobs:
       contents: read
     env:
       CONTAINER_ENGINE: docker
-      FROM_OPERATOR_MANIFEST: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/${{ matrix.from_branch }}/dist/rhdh/install.yaml
+      FROM_OPERATOR_MANIFEST: https://raw.githubusercontent.com/redhat-developer/rhdh-operator/refs/heads/${{ matrix.from_branch }}/dist/rhdh/install.yaml
       TO_OPERATOR_MANIFEST: ${{ github.workspace }}/dist/rhdh/install.yaml
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ matrix.to_branch }}
           fetch-depth: 0
           persist-credentials: false
 
