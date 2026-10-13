@@ -25,6 +25,12 @@ const (
 	postgresqlProofValue    = "postgresql-15-to-18"
 )
 
+// postgresqlRestoreBootstrapConflict matches the only restore errors that are expected when a pg_dumpall dump is
+// restored into a freshly initialized PostgreSQL instance, which already contains the bootstrap superuser and the
+// default database. Keep this in sync with docs/postgresql-upgrade.md and the RHDH Helm upgrade CI
+// (.ci/pipelines/lib/postgres.sh in redhat-developer/rhdh).
+var postgresqlRestoreBootstrapConflict = regexp.MustCompile(`^ERROR:\s+(role|database) "postgres" already exists$`)
+
 type postgresqlUpgradeState struct {
 	dumpPath        string
 	postgresPodUID  string
@@ -32,6 +38,10 @@ type postgresqlUpgradeState struct {
 	secretUID       string
 	backstagePodUID string
 	databaseNames   []string
+	// tableRowCounts holds, per database, the exact row count of every user table before the dump.
+	tableRowCounts map[string][]string
+	// originalReplicas is the value of spec.deployment.patch.spec.replicas before the upgrade, or empty if unset.
+	originalReplicas string
 }
 
 func logPostgresqlUpgradeCheckpoint(name string, fields ...string) {
@@ -85,11 +95,22 @@ INSERT INTO public.rhdh_postgresql_upgrade_test VALUES ('`+postgresqlProofValue+
 	)
 
 	By("stopping Backstage before taking the PostgreSQL dump")
+	state.originalReplicas = backstagePatchReplicas(namespace, crName)
 	setBackstageReplicas(namespace, crName, 0)
 	waitForNoPods(namespace, fmt.Sprintf("rhdh.redhat.com/app=backstage-%s", crName))
 
+	By("recording the exact row counts of every PostgreSQL 15 table")
+	state.tableRowCounts = postgresqlTableRowCounts(namespace, postgresPod, state.databaseNames)
+	Expect(hasBackstageOwnedRows(state.tableRowCounts[postgresqlProofDatabase])).To(BeTrue(),
+		"expected Backstage-owned rows in %s, got %v", postgresqlProofDatabase, state.tableRowCounts[postgresqlProofDatabase])
+
 	By("dumping all PostgreSQL 15 databases and roles")
 	state.dumpPath = dumpPostgresql(namespace, postgresPod)
+
+	// The source Operator ignores this annotation. The upgraded Operator honours it and applies the PostgreSQL 18
+	// StatefulSet with zero replicas, so PostgreSQL 18 never starts against the PostgreSQL 15 data directory.
+	By("idling the instance before upgrading the operator")
+	setIdleAnnotation(namespace, crName, true)
 
 	return state
 }
@@ -105,33 +126,25 @@ func completePostgresqlUpgrade(namespace, crName string, state *postgresqlUpgrad
 		g.Expect(strings.TrimSpace(string(out))).To(ContainSubstring(postgresqlTargetImage))
 	}, 5*time.Minute, 5*time.Second).Should(Succeed())
 
-	operatorScaledDown := false
-	DeferCleanup(func() {
-		if operatorScaledDown {
-			if err := scaleDeploymentCommand(_namespace, "rhdh-operator", 1); err != nil {
-				GinkgoWriter.Printf("Warning: failed to restore the operator replica: %v\n", err)
-			}
-		}
-	})
+	By("waiting for the idled PostgreSQL StatefulSet to have no pods")
+	Eventually(func(g Gomega) {
+		out, err := helper.Run(exec.Command(helper.GetPlatformTool(), "-n", namespace, "get", "statefulset",
+			statefulSetName, "-o", "jsonpath={.spec.replicas}"))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(strings.TrimSpace(string(out))).To(Equal("0"))
+	}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	waitForNoPods(namespace, fmt.Sprintf("rhdh.redhat.com/app=%s", statefulSetName))
 
-	By("stopping the operator while replacing the PostgreSQL volume")
-	scaleDeployment(_namespace, "rhdh-operator", 0)
-	operatorScaledDown = true
-	waitForNoPods(_namespace, managerPodLabel)
-
-	By("deleting the PostgreSQL 15 StatefulSet and persistent volume")
-	deleteResource(namespace, "statefulset", statefulSetName)
+	By("deleting the PostgreSQL 15 persistent volume claim")
+	Expect(resourceUID(namespace, "pvc", postgresqlPVCName(crName))).To(Equal(state.pvcUID))
 	deleteResource(namespace, "pvc", postgresqlPVCName(crName))
 	Expect(resourceUID(namespace, "secret", postgresqlSecretName(crName))).To(Equal(state.secretUID))
 
-	By("restarting the operator to provision a fresh PostgreSQL 18 database")
-	scaleDeployment(_namespace, "rhdh-operator", 1)
-	operatorScaledDown = false
-	waitForOperatorRollout()
-	EventuallyWithOffset(1, verifyControllerUp, 5*time.Minute, 5*time.Second).
-		WithArguments(managerPodLabel).Should(Succeed())
+	By("waking the instance to provision a fresh PostgreSQL 18 database while Backstage stays stopped")
+	setIdleAnnotation(namespace, crName, false)
 
 	postgresPod := waitForPostgresql(namespace, crName, postgresqlTargetImage, postgresqlTargetVersion)
+	waitForNoPods(namespace, fmt.Sprintf("rhdh.redhat.com/app=backstage-%s", crName))
 	targetPostgresPodUID := resourceUID(namespace, "pod", postgresPod)
 	targetPVCUID := resourceUID(namespace, "pvc", postgresqlPVCName(crName))
 	targetSecretUID := resourceUID(namespace, "secret", postgresqlSecretName(crName))
@@ -152,16 +165,20 @@ func completePostgresqlUpgrade(namespace, crName string, state *postgresqlUpgrad
 	restorePostgresql(namespace, postgresPod, state.dumpPath)
 	restoredDatabaseNames := postgresqlDatabaseNames(namespace, postgresPod)
 	Expect(restoredDatabaseNames).To(Equal(state.databaseNames))
-	refreshPostgresqlCollations(namespace, postgresPod)
+	restoredRowCounts := postgresqlTableRowCounts(namespace, postgresPod, restoredDatabaseNames)
+	Expect(restoredRowCounts).To(Equal(state.tableRowCounts))
+	Expect(postgresqlCollationMismatches(namespace, postgresPod)).To(BeEmpty())
 	Expect(queryPostgresqlUpgradeProof(namespace, postgresPod)).To(Equal(postgresqlProofValue))
 	logPostgresqlUpgradeCheckpoint("restore-verified",
 		fmt.Sprintf("databases=%d", len(restoredDatabaseNames)),
+		fmt.Sprintf("tables=%d", countTables(restoredRowCounts)),
+		"collationMismatches=0",
 		fmt.Sprintf("proofDatabase=%s", postgresqlProofDatabase),
 		fmt.Sprintf("proofValue=%s", postgresqlProofValue),
 	)
 
-	By("starting Backstage against the restored PostgreSQL 18 database")
-	setBackstageReplicas(namespace, crName, 1)
+	By("restoring the original Backstage replica configuration")
+	restoreBackstageReplicas(namespace, crName, state.originalReplicas)
 	waitForBackstagePodReplacement(namespace, crName, state.backstagePodUID)
 }
 
@@ -273,14 +290,23 @@ func validatePostgresqlRestoreErrors(stderr string) error {
 			errorLines = append(errorLines, strings.TrimSpace(line))
 		}
 	}
-	if len(errorLines) != 1 {
-		if len(errorLines) == 0 {
-			return fmt.Errorf("expected one bootstrap role conflict, got none")
+	unexpected := make([]string, 0)
+	roleConflict := false
+	for _, line := range errorLines {
+		if !postgresqlRestoreBootstrapConflict.MatchString(line) {
+			unexpected = append(unexpected, line)
+			continue
 		}
-		return fmt.Errorf("unexpected PostgreSQL restore errors: %s", strings.Join(errorLines, "; "))
+		if strings.Contains(line, "role") {
+			roleConflict = true
+		}
 	}
-	if !regexp.MustCompile(`^ERROR:\s+role "postgres" already exists$`).MatchString(errorLines[0]) {
-		return fmt.Errorf("unexpected PostgreSQL restore errors: %s", errorLines[0])
+	if len(unexpected) > 0 {
+		return fmt.Errorf("unexpected PostgreSQL restore errors: %s", strings.Join(unexpected, "; "))
+	}
+	// pg_dumpall always recreates the bootstrap superuser; seeing the conflict proves the role section was replayed.
+	if !roleConflict {
+		return fmt.Errorf("expected the bootstrap role conflict, got: %q", errorLines)
 	}
 	return nil
 }
@@ -293,18 +319,52 @@ func postgresqlDatabaseNames(namespace, podName string) []string {
 	return helper.GetNonEmptyLines(strings.TrimSpace(string(out)))
 }
 
-func refreshPostgresqlCollations(namespace, podName string) {
+// postgresqlTableRowCountsSQL lists every user table with its exact row count, one "schema.table=count" per line.
+// The same query is documented in docs/postgresql-upgrade.md.
+const postgresqlTableRowCountsSQL = `SELECT format('%I.%I=%s', table_schema, table_name,
+  (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text)
+FROM information_schema.tables
+WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY table_schema, table_name;`
+
+func postgresqlTableRowCounts(namespace, podName string, databases []string) map[string][]string {
+	counts := make(map[string][]string, len(databases))
+	for _, database := range databases {
+		out, err := helper.Run(postgresqlSQLCommand(namespace, podName, database,
+			"-tA", "-v", "ON_ERROR_STOP=1", "-c", postgresqlTableRowCountsSQL))
+		Expect(err).NotTo(HaveOccurred())
+		counts[database] = helper.GetNonEmptyLines(strings.TrimSpace(string(out)))
+	}
+	return counts
+}
+
+// hasBackstageOwnedRows reports whether a database contains rows in at least one table that was not created by this test.
+func hasBackstageOwnedRows(tableRowCounts []string) bool {
+	for _, line := range tableRowCounts {
+		table, count, found := strings.Cut(line, "=")
+		if found && table != "public.rhdh_postgresql_upgrade_test" && count != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func countTables(tableRowCounts map[string][]string) int {
+	total := 0
+	for _, tables := range tableRowCounts {
+		total += len(tables)
+	}
+	return total
+}
+
+// postgresqlCollationMismatches returns the databases whose recorded collation version differs from the version
+// provided by the operating system. A logical restore recreates every database, so none are expected.
+func postgresqlCollationMismatches(namespace, podName string) []string {
 	out, err := helper.Run(postgresqlSQLCommand(namespace, podName, "postgres",
 		"-tA", "-v", "ON_ERROR_STOP=1", "-c",
-		"SELECT format('ALTER DATABASE %I REFRESH COLLATION VERSION;', datname) FROM pg_database WHERE datallowconn AND datname <> 'template0' ORDER BY datname;"))
+		"SELECT datname FROM pg_database WHERE datallowconn AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid) ORDER BY datname;"))
 	Expect(err).NotTo(HaveOccurred())
-
-	statements := helper.GetNonEmptyLines(string(out))
-	for _, statement := range statements {
-		_, err = runPostgresqlSQL(namespace, podName, "postgres", statement)
-		Expect(err).NotTo(HaveOccurred())
-	}
-	logPostgresqlUpgradeCheckpoint("collations-refreshed", fmt.Sprintf("databases=%d", len(statements)))
+	return helper.GetNonEmptyLines(strings.TrimSpace(string(out)))
 }
 
 func runCommand(cmd *exec.Cmd, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -327,15 +387,34 @@ func setBackstageReplicas(namespace, crName string, replicas int) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-func scaleDeployment(namespace, name string, replicas int) {
-	err := scaleDeploymentCommand(namespace, name, replicas)
+func backstagePatchReplicas(namespace, crName string) string {
+	out, err := helper.Run(exec.Command(helper.GetPlatformTool(), "-n", namespace, "get", "backstage", crName,
+		"-o", "jsonpath={.spec.deployment.patch.spec.replicas}"))
 	Expect(err).NotTo(HaveOccurred())
+	return strings.TrimSpace(string(out))
 }
 
-func scaleDeploymentCommand(namespace, name string, replicas int) error {
-	_, err := helper.Run(exec.Command(helper.GetPlatformTool(), "-n", namespace, "scale", "deployment", name,
-		fmt.Sprintf("--replicas=%d", replicas)))
-	return err
+// restoreBackstageReplicas puts back the replica setting recorded before the upgrade. When none was set, the field is
+// removed instead of forcing a value, so the default (or an HPA) controls the replica count again.
+func restoreBackstageReplicas(namespace, crName, originalReplicas string) {
+	value := "null"
+	if originalReplicas != "" {
+		value = originalReplicas
+	}
+	patch := fmt.Sprintf(`{"spec":{"deployment":{"patch":{"spec":{"replicas":%s}}}}}`, value)
+	err := helper.PatchBackstageCR(namespace, crName, patch, "merge")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(backstagePatchReplicas(namespace, crName)).To(Equal(originalReplicas))
+}
+
+func setIdleAnnotation(namespace, crName string, idle bool) {
+	annotation := "rhdh.redhat.com/idle=true"
+	if !idle {
+		annotation = "rhdh.redhat.com/idle-"
+	}
+	_, err := helper.Run(exec.Command(helper.GetPlatformTool(), "-n", namespace, "annotate", "backstage", crName,
+		annotation, "--overwrite"))
+	Expect(err).NotTo(HaveOccurred())
 }
 
 func waitForNoPods(namespace, label string) {

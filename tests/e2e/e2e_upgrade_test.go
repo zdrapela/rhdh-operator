@@ -22,7 +22,7 @@ var _ = Describe("Operator upgrade with existing instances", func() {
 		if isEnvEnabled("BACKSTAGE_OPERATOR_TESTS_POSTGRESQL_UPGRADE") {
 			suiteConfig, _ := GinkgoConfiguration()
 			Expect(suiteConfig.ParallelTotal).To(Equal(1),
-				"the PostgreSQL upgrade test scales the shared Operator deployment and must run with one Ginkgo process")
+				"the PostgreSQL upgrade test replaces the shared Operator installation and must run with one Ginkgo process")
 		}
 		ns = fmt.Sprintf("e2e-test-%d-%s", GinkgoParallelProcess(), helper.RandString(5))
 		helper.CreateNamespace(ns)
