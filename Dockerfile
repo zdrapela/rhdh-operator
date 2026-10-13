@@ -8,7 +8,7 @@ ARG TARGETOS
 ARG TARGETARCH
 # Build as the go-toolset default user (non-root). Hermeto prefetch must chmod the
 # /cachi2 cache (see hack/local-hermeto-build.sh and CI) so this user can use gomod offline.
-ENV GOPATH=/go/
+ENV GOPATH=/opt/app-root/src/go
 ENV GOCACHE=/tmp/go-build-cache
 
 ENV EXTERNAL_SOURCE=.
